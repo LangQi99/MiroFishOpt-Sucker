@@ -78,6 +78,9 @@ class Config:
     # 文本处理配置
     DEFAULT_CHUNK_SIZE = 500  # 默认切块大小
     DEFAULT_CHUNK_OVERLAP = 50  # 默认重叠大小
+
+    # 实体/关系抽取并发数（增大可加速图谱构建，受 LLM API 限速影响）
+    EXTRACTION_CONCURRENCY = int(os.environ.get('EXTRACTION_CONCURRENCY', '8'))
     
     # OASIS模拟配置
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))

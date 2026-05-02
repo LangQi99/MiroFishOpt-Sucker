@@ -12,6 +12,7 @@
 
 import json
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -288,42 +289,72 @@ class SimulationConfigGenerator:
             document_text=document_text,
             entities=entities
         )
-        
+
         reasoning_parts = []
-        
-        # ========== 步骤1: 生成时间配置 ==========
-        report_progress(1, "生成时间配置...")
+
+        # 步骤1（时间配置）、步骤2（事件配置）、步骤3-N（Agent分批）完全独立，全部并发。
         num_entities = len(entities)
-        time_config_result = self._generate_time_config(context, num_entities)
-        time_config = self._parse_time_config(time_config_result, num_entities)
-        reasoning_parts.append(f"时间配置: {time_config_result.get('reasoning', '成功')}")
-        
-        # ========== 步骤2: 生成事件配置 ==========
-        report_progress(2, "生成事件配置和热点话题...")
-        event_config_result = self._generate_event_config(context, simulation_requirement, entities)
-        event_config = self._parse_event_config(event_config_result)
-        reasoning_parts.append(f"事件配置: {event_config_result.get('reasoning', '成功')}")
-        
-        # ========== 步骤3-N: 分批生成Agent配置 ==========
+        batch_ranges = [
+            (i, i * self.AGENTS_PER_BATCH, min((i + 1) * self.AGENTS_PER_BATCH, num_entities))
+            for i in range(num_batches)
+        ]
+
+        # 任务总数 = 时间配置 + 事件配置 + Agent批次
+        all_futures = {}
+        with ThreadPoolExecutor(max_workers=2 + num_batches) as executor:
+            f_time = executor.submit(self._generate_time_config, context, num_entities)
+            all_futures[f_time] = "time"
+
+            f_event = executor.submit(
+                self._generate_event_config, context, simulation_requirement, entities
+            )
+            all_futures[f_event] = "event"
+
+            for batch_idx, start_idx, end_idx in batch_ranges:
+                batch_entities = entities[start_idx:end_idx]
+                f = executor.submit(
+                    self._generate_agent_configs_batch,
+                    context=context,
+                    entities=batch_entities,
+                    start_idx=start_idx,
+                    simulation_requirement=simulation_requirement,
+                )
+                all_futures[f] = ("agent_batch", batch_idx, start_idx, end_idx)
+
+            # 收集结果
+            time_config_result = None
+            event_config_result = None
+            agent_batch_results: Dict[int, list] = {}
+            completed_steps = 0
+
+            for future in as_completed(all_futures):
+                tag = all_futures[future]
+                completed_steps += 1
+
+                if tag == "time":
+                    time_config_result = future.result()
+                    report_progress(completed_steps, "时间配置生成完成")
+                elif tag == "event":
+                    event_config_result = future.result()
+                    report_progress(completed_steps, "事件配置生成完成")
+                else:
+                    _, batch_idx, start_idx, end_idx = tag
+                    agent_batch_results[batch_idx] = future.result()
+                    report_progress(
+                        completed_steps,
+                        f"Agent配置已完成批次 {batch_idx + 1}/{num_batches} ({start_idx + 1}-{end_idx}/{num_entities})"
+                    )
+
+        # 按原始顺序合并 Agent 配置
         all_agent_configs = []
         for batch_idx in range(num_batches):
-            start_idx = batch_idx * self.AGENTS_PER_BATCH
-            end_idx = min(start_idx + self.AGENTS_PER_BATCH, len(entities))
-            batch_entities = entities[start_idx:end_idx]
-            
-            report_progress(
-                3 + batch_idx,
-                f"生成Agent配置 ({start_idx + 1}-{end_idx}/{len(entities)})..."
-            )
-            
-            batch_configs = self._generate_agent_configs_batch(
-                context=context,
-                entities=batch_entities,
-                start_idx=start_idx,
-                simulation_requirement=simulation_requirement
-            )
-            all_agent_configs.extend(batch_configs)
-        
+            all_agent_configs.extend(agent_batch_results[batch_idx])
+
+        time_config = self._parse_time_config(time_config_result, num_entities)
+        reasoning_parts.append(f"时间配置: {time_config_result.get('reasoning', '成功')}")
+
+        event_config = self._parse_event_config(event_config_result)
+        reasoning_parts.append(f"事件配置: {event_config_result.get('reasoning', '成功')}")
         reasoning_parts.append(f"Agent配置: 成功生成 {len(all_agent_configs)} 个")
         
         # ========== 为初始帖子分配发布者 Agent ==========
